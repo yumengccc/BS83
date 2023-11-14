@@ -1,0 +1,440 @@
+---
+title: "FINAL"
+author: "Yumeng CAO"
+date: "2023-05-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Analysis of an HSNC Dataset
+
+```{r,echo=TRUE}
+require(Biobase)
+require(BS831)
+library(dplyr)
+Sys.setenv(OMPATH = "/Users/ymc/Google Drive/我的云端硬盘/BS831")
+OMPATH <- Sys.getenv("OMPATH")
+```
+
+### Data Loading & Preprocessing
+
+```{r,echo=TRUE}
+## read CPM data
+CPM <- readRDS( file.path(OMPATH,"data","HNSC_htseq_normalized_AEvsG1vsG3.RDS") )
+## show the distribution of 'grades'
+table(CPM$grade)
+## show the distribution of 'stages'
+table(CPM$stage)
+## simplify stage by grouping categories (i,ii,iii -> lo; iv -> hi)
+stage <- factor(c("AE","stage.lo","stage.lo","stage.lo","stage.hi")[CPM$stage],
+                levels=c("AE","stage.lo","stage.hi"))
+CPM$stage <- stage
+## look at the "cross-stratification" of grade and stage
+table(CPM$grade,CPM$stage)
+```
+
+#### Gene Filtering
+
+```{r,echo=TRUE}
+## Remove those genes without at least 1 read per million in at least
+## 'n' samples, where n is the number of samples in the 'smallest'
+## phenotype class
+removeLowExpression <- function(eset, class_id, min.thresh=0)
+{
+  groups <- pData(eset)[,class_id]
+  min.samples <-
+    max(min.thresh,min( sapply(levels(groups), function(x){length(which(groups %in% x))})))
+  rpm <- colSums(exprs(eset))/1000000
+  filter_ind <- t(apply(exprs(eset), 1,function(x) {x >rpm}))
+  filter_ind_rowsums <- apply(filter_ind, 1, sum)
+  return(eset[filter_ind_rowsums > min.samples,])
+}
+CPM1 <- removeLowExpression(eset=CPM, class_id="grade", min.thresh=4)
+print(dim(CPM1))
+```
+
+#### Log transformation
+
+```{r,echo=TRUE}
+## let us log-transform the CPM data for subsequent handling
+CPM2 <- CPM1
+exprs(CPM2) <- log2(exprs(CPM1)+1)
+## show distribution before and after log2-transformation
+par(mfrow=c(1,2))
+hist(exprs(CPM1),main = "Before log2-transformation")
+hist(exprs(CPM2), main = "After log2-transformation" )
+```
+
+#### Sample Subsetting
+
+```{r,echo=TRUE}
+g1vsg3 <- CPM2[,CPM2$grade %in% c("g1","g3")]
+exprs(g1vsg3) <- log2(exprs(g1vsg3)+1)
+g1vsg3$grade <- droplevels(g1vsg3$grade)
+table(g1vsg3$grade,useNA="ifany")
+```
+
+#### Genesets Uploading
+
+```{r,echo=TRUE}
+read.gmt <- function( gmt.file ) {
+    gmt <- scan(gmt.file,"character",sep="\n")
+    gmt <- lapply(gmt,function(Z) unlist(strsplit(Z,"\t"))[-2])
+    names(gmt) <- sapply(gmt,function(Z) Z[1])
+    gmt <- lapply(gmt,function(Z) Z[-1])
+}
+## reading in the HALLMARKS genesets
+hall <- read.gmt( file.path(OMPATH,"data","h.all.v6.1.symbols.gmt") )
+print(head(names(hall))) # show first few genesets' names
+
+keepGS <- sapply(hall,function(X) length(intersect(X,fData(CPM2)[,"hgnc_symbol"]))>=5)
+hall <- hall[keepGS]
+## show how many genesets
+length(hall)
+
+## show geneset sizes
+quantile(lengths(hall))
+```
+
+### Exercise 1: Pathway Enrichment Analysis
+
+```{r,echo=TRUE}
+source("https://raw.githubusercontent.com/montilab/BS831/master/R/fast.tscore.R")
+tst <- fast.tscore(x=exprs(g1vsg3),g1vsg3$grade,do.test=TRUE)[,"score"]
+head(tst)
+
+genesSorted <- fData(g1vsg3)[order(tst),"hgnc_symbol"] # g3 markers come first (negative t scores)
+
+KShall <- data.frame(ks.score=rep(NA,length(hall)),
+                     p.value=NA,
+                     q.value=NA,
+                     row.names=names(hall))
+
+pdf("/Users/ymc/Desktop/BS831/Final/KShall.pdf")
+for (gsetName in names(hall)) {
+  genes <- intersect(genesSorted, hall[[gsetName]])
+  gene_ranks <- match(genes, genesSorted)
+  KShall[gsetName, c("ks.score", "p.value")] <- ksGenescore(n.x=nrow(g1vsg3), y=gene_ranks, do.plot=TRUE, bare=TRUE)
+}
+dev.off()
+
+KShall$q.value <- p.adjust(KShall$p.value, method = "fdr")
+print(head(KShall))
+```
+
+### Exercise 2: Testing for Normality of Gene Distributions
+
+```{r,echo=TRUE}
+st1 <- shapiro.test( exprs(CPM2)[1,])
+print(st1)
+
+multi.w <- function(gene){
+  unlist(shapiro.test(gene)[c("statistic","p.value")])
+}
+
+ST <- data.frame(t(apply(exprs(CPM2), 1, multi.w))) %>%
+      dplyr::mutate(q.value=p.adjust(p.value,method="BH"))
+
+print(head(ST))
+
+#double-check
+print(ST[c("ENSG00000164663", "ENSG00000100246", "ENSG00000100034", "ENSG00000105248", "ENSG00000128973", "ENSG00000141338"), ]) 
+```
+
+## Clustering
+### Hierarchical Clustering
+
+```{r,echo=TRUE}
+## performing variation filtering in log space ..
+CPM3 <- BS831::variationFilter(CPM2,ngenes=2000, do.plot=FALSE)
+
+## clustering (choose the proper distances for the two dimensions – see slides)
+hc.col <- hclust(dist(t(exprs(CPM3)),method="euclidean"), method="ward.D" )
+hc.row <- hclust(as.dist(1-cor(t(exprs(CPM3)))), method="ward.D" )
+
+library(pheatmap)
+
+## expression levels color coding
+bwrPalette <- colGradient(c("blue","white","red"),length=13)
+## sample annotation color coding
+annot <- pData(CPM3)[,c("grade","stage")]
+annotCol <- list(
+  grade = c("white","green","darkgreen"),
+  stage = c("white","green","darkgreen")
+)
+names(annotCol$grade) <- levels(annot$grade)
+names(annotCol$stage) <- levels(annot$stage)
+
+## heatmap visualization
+pheatmap(exprs(CPM3),
+         color=bwrPalette,
+         annotation_col = annot,
+         annotation_colors = annotCol,
+         cluster_rows=hc.row, # the result of the hclust call above
+         cluster_cols=hc.col, # ditto
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         scale = "row")
+```
+
+### Exercise 3: Testing for Sample Cluster Enrichment
+
+```{r,echo=TRUE}
+C3 <- cutree(hc.col,3)
+## add cluster annotation to heatmap annotation
+annot1 <- annot
+annotCol1 <- annotCol
+annot1$cluster <- factor(C3)
+annotCol1$cluster <- c("yellow","orange","purple")
+names(annotCol1$cluster) <- levels(annot1$cluster)
+
+pheatmap(exprs(CPM3),
+         color=bwrPalette,
+         annotation_col = annot1,
+         annotation_colors = annotCol1,
+         cluster_rows=hc.row,
+         cluster_cols=hc.col,
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         scale = "row")
+
+print(table(C3,CPM3$grade))
+fisher.test(C3,CPM3$grade)
+
+print(table(C3,CPM3$stage))
+fisher.test(C3,CPM3$stage)
+
+cluster.grade <- list(cluster1="AE",
+                      cluster2="g3",
+                      cluster3="g1")
+cluster.grade
+
+cluster.stage <- list(cluster1="AE",
+                      cluster2="stage.hi",
+                      cluster3="stage.lo")
+cluster.stage
+```
+
+### Exercise 4: Compare Clustering Results w/ and w/o Optimal Leaf Ordering
+
+Yes, the order of clusters (both rows and columns) changed as it minimizes the distance between adjacent items. The gradient of colors is more smoother.
+
+```{r,echo=TRUE}
+require(cba) # the package implementing the optimal ordering
+
+ho.col <- BS831::hcopt(dist(t(exprs(CPM3)),method="euclidean"), method="ward.D" )
+ho.row <- BS831::hcopt(as.dist(1-cor(t(exprs(CPM3)))), method="ward.D" )
+
+## heatmap visualization
+pheatmap(exprs(CPM3),
+         color=bwrPalette,
+         annotation_col = annot,
+         annotation_colors = annotCol,
+         cluster_rows=ho.row, # the result of the hclust call above
+         cluster_cols=ho.col, # ditto
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         scale = "row")
+
+hclust.pairs <- cbind(hc.col$order[-ncol(CPM3)],hc.col$order[-1])
+hclust.dist <- apply(hclust.pairs,1,function(X) dist(t(exprs(CPM3)[,X])))
+
+hcopt.pairs <- cbind(ho.col$order[-ncol(CPM3)], ho.col$order[-1])
+hcopt.dist <- apply(hcopt.pairs, 1, function(X) dist(t(exprs(CPM3)[, X])))
+
+DIST <- data.frame(hclust=sort(hclust.dist),
+                   hcopt=sort(hcopt.dist))
+##saveRDS(DIST,file=file.path(SCCPATH,,"<studentID>/exercise4.RDS"))
+print(head(DIST))
+
+# Create a scatter plot
+plot(DIST$hclust, DIST$hcopt,
+     xlab="sorted hclust distances",
+     ylab="sorted hcopt distances")
+abline(a=0, b=1, col="red")
+```
+
+## Classification
+### Exercise 5: Build and Compare Classifiers
+
+```{r,echo=TRUE}
+CPM4 <- CPM3[,CPM3$grade!="AE"]
+CPM4$grade <- droplevels(CPM4$grade)
+CPM4$stage <- droplevels(CPM4$stage)
+print(table(CPM4$grade,CPM4$stage))
+```
+
+#### Feature Selection
+
+```{r,echo=TRUE}
+require(limma)
+featureSelect <- function( DAT, CLS, nfeat, balanced=TRUE )
+{
+  ## BEGIN input checks
+  if ( class(DAT)!="ExpressionSet" ) stop( "'ExpressionSet' object expcted: ", class(DAT) )
+  if ( length(CLS)!=ncol(DAT) ) stop( "CLS and DAT have incompatible sizes" )
+  if ( length(unique(CLS))!=2 ) stop( "CLS must be a binary feature" )
+  if ( nfeat<1 | nfeat>nrow(DAT) ) stop( "nfeat must be in [1,nrow(DAT)]" )
+  ## END checks
+
+  design= model.matrix(~as.factor(CLS))
+  fitTrn <- lmFit(DAT,design)
+  fitTrn <- eBayes(fitTrn)
+  TT <- topTable(fitTrn,coef=2,number=Inf)
+
+  DAT1 <- {
+    if ( balanced ) # pick half markers in each direction
+      DAT[c(match(rownames(TT)[order(TT$t,decreasing=TRUE)[1:ceiling(nfeat/2)]],featureNames(DAT)),
+            match(rownames(TT)[order(TT$t,decreasing=FALSE)[1:ceiling(nfeat/2)]],featureNames(DAT))),]
+    else            # pick top markers irrespective of direction
+      DAT[match(rownames(TT)[order(abs(TT$t),decreasing=TRUE)[1:nfeat]],featureNames(DAT)),]
+  }
+  list(dat=DAT1,tbl=TT[match(featureNames(DAT1),rownames(TT)),])
+}
+```
+
+```{r,echo=TRUE}
+library(caret)
+set.seed(1234)
+splitIdx <- caret::createDataPartition(CPM4$grade, p=0.6, list=FALSE, times=1)
+CPM4_train <- CPM4[,splitIdx]
+CPM4_test <- CPM4[,-splitIdx]
+```
+
+#### Random Forest: 20 balanced features in the training (10-fold cross validation)
+
+This method of feature selection prior to performing cross-validation is biased since the selected features will only be optimal for the specific training set used, but may lead to overfitting for the specific training set and may not perform well for new data set.
+
+```{r,echo=TRUE}
+fitControl <- trainControl(method = "cv",
+                           number = 10,
+                           classProbs = T,
+                           summaryFunction = twoClassSummary)
+
+CPM4_train_20 <- featureSelect(CPM4_train, CPM4_train$grade, nfeat = 20, balanced = TRUE)$dat
+
+set.seed(1234)
+
+RF_20 <- train(x = t(exprs(CPM4_train_20)),
+               y = CPM4_train_20$grade,
+               method="rf",
+               trControl=fitControl,
+               tuneGrid=expand.grid(mtry=c(2, 5, 10, 15, 18, 20)),
+               metric='ROC')
+
+RF_20
+
+plot(RF_20, metric = "ROC")
+
+best_RF_20 <- subset(RF_20$results, mtry == RF_20$bestTune$mtry)
+best_RF_20 <- data.frame(AUC = best_RF_20$ROC, Sens = best_RF_20$Sens, Spec = best_RF_20$Spec, row.names = "Best_RF_20")
+best_RF_20
+```
+
+#### Random Forest: 50 balanced features in the training (10-fold cross validation)
+
+```{r,echo=TRUE}
+CPM4_train_50 <- featureSelect(CPM4_train, CPM4_train$grade, nfeat = 50, balanced = TRUE)$dat
+
+set.seed(1234)
+
+RF_50 <- train(x = t(exprs(CPM4_train_50)),
+               y = CPM4_train_50$grade,
+               method="rf",
+               trControl=fitControl,
+               tuneGrid=expand.grid(mtry=c(5, 8, 10, 20, 30, 40, 50)),
+               metric='ROC')
+
+RF_50
+
+plot(RF_50, metric = "ROC")
+
+best_RF_50 <- subset(RF_50$results, mtry == RF_50$bestTune$mtry)
+best_RF_50 <- data.frame(AUC = best_RF_50$ROC, Sens = best_RF_50$Sens, Spec = best_RF_50$Spec, row.names = "Best_RF_50")
+best_RF_50
+```
+
+#### Random Forest: 100 balanced features in the training (10-fold cross validation)
+
+```{r,echo=TRUE}
+CPM4_train_100 <- featureSelect(CPM4_train, CPM4_train$grade, nfeat = 100, balanced = TRUE)$dat
+
+set.seed(1234)
+
+RF_100 <- train(x = t(exprs(CPM4_train_100)),
+               y = CPM4_train_100$grade,
+               method="rf",
+               trControl=fitControl,
+               tuneGrid=expand.grid(mtry=c(5, 10, 20, 30, 50, 60, 80, 100)),
+               metric='ROC')
+
+RF_100
+
+plot(RF_100, metric = "ROC")
+
+best_RF_100 <- subset(RF_100$results, mtry == RF_100$bestTune$mtry)
+best_RF_100 <- data.frame(AUC = best_RF_100$ROC, Sens = best_RF_100$Sens, Spec = best_RF_100$Spec, row.names = "Best_RF_100")
+best_RF_100
+```
+
+#### Random Forest: 500 balanced features in the training (10-fold cross validation)
+
+```{r,echo=TRUE}
+CPM4_train_500 <- featureSelect(CPM4_train, CPM4_train$grade, nfeat = 500, balanced = TRUE)$dat
+
+set.seed(1234)
+
+RF_500 <- train(x = t(exprs(CPM4_train_500)),
+               y = CPM4_train_500$grade,
+               method="rf",
+               trControl=fitControl,
+               tuneGrid=expand.grid(mtry=c(23, 50, 100, 200, 250, 350, 500)),
+               metric='ROC')
+
+RF_500
+
+plot(RF_500, metric = "ROC")
+
+best_RF_500 <- subset(RF_500$results, mtry == RF_500$bestTune$mtry)
+best_RF_500 <- data.frame(AUC = best_RF_500$ROC, Sens = best_RF_500$Sens, Spec = best_RF_500$Spec, row.names = "Best_RF_500")
+best_RF_500
+```
+
+#### Summary Table.
+
+```{r,echo=TRUE}
+Best_RF_combined <- rbind(best_RF_20, best_RF_50, best_RF_100, best_RF_500)
+Best_RF_combined
+```
+#### The best classifier is RF_100 with 100 balanced features based on the AUC, and apply it to the validation set.
+
+```{r,echo=TRUE}
+## predicting using the probabilities (nice because you can get ROC)
+probsRF <- caret::extractProb(list(model=RF_100),
+                     testX=t(exprs(CPM4_test)),
+                     testY=CPM4_test$grade) |> 
+                     dplyr::filter(dataType == "Test")
+
+RFtest_confusion <- caret::confusionMatrix(
+                     data = probsRF$pred,
+                     reference = probsRF$obs,
+                     positive = "g1")
+
+## Make sure the levels are appropriate for twoClassSummary(), ie case group is first level
+levs <- c("g1", "g3")
+probsRF$obs <- factor(probsRF$obs, levels = levs)
+probsRF$pred <- factor(probsRF$pred, levels = levs)
+table(probsRF$obs, probsRF$pred)
+
+## Report Accuracy
+mean(probsRF$obs==probsRF$pred)
+## Report AUC, sensitivity, specificity
+twoClassSummary(probsRF, lev = levels(probsRF$obs))
+## Report confusion matrix
+print(RFtest_confusion)
+```
+
+##### AUC=0.9257812, accuracy=0.875, sensitivity=0.9375, specificity=0.8125.
